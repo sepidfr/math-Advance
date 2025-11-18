@@ -1,76 +1,135 @@
 import math
-from io import BytesIO
+from typing import Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
-import cv2
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+
 import streamlit as st
-
-from gfpgan import GFPGANer
+import matplotlib.pyplot as plt
 
 
 # ==========================
-# 1) Load pretrained GFPGAN
+# 1) Autoencoder definition
 # ==========================
+
+class CAE(nn.Module):
+    def __init__(self, latent_dim: int = 128):
+        super().__init__()
+        # Encoder: 3×112×112 → latent_dim
+        self.enc = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(inplace=True),   # 56×56
+            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(inplace=True),  # 28×28
+            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True), # 14×14
+            nn.Conv2d(128, 256, 3, 2, 1), nn.ReLU(inplace=True) # 7×7
+        )
+        self.flatten = nn.Flatten()
+        self.fc_mu   = nn.Linear(256 * 7 * 7, latent_dim)
+
+        # Decoder: latent_dim → 3×112×112
+        self.fc_dec  = nn.Linear(latent_dim, 256 * 7 * 7)
+        self.dec = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(inplace=True),  # 14×14
+            nn.ConvTranspose2d(128, 64,  4, 2, 1), nn.ReLU(inplace=True),  # 28×28
+            nn.ConvTranspose2d(64,  32,  4, 2, 1), nn.ReLU(inplace=True),  # 56×56
+            nn.ConvTranspose2d(32,  3,   4, 2, 1), nn.Tanh()               # 112×112 in [-1,1]
+        )
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.enc(x)
+        z = self.fc_mu(self.flatten(h))
+        return z
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.fc_dec(z).view(-1, 256, 7, 7)
+        xhat = self.dec(h)
+        return xhat
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = self.encode(x)
+        xhat = self.decode(z)
+        return xhat, z
+
+
+# ==========================================
+# 2) Utility: transforms, metrics, denormal
+# ==========================================
+
+IMG_SIZE = 112
+
+preprocess = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5] * 3, [0.5] * 3)
+])
+
+
+def denorm(x: torch.Tensor) -> torch.Tensor:
+    """Convert from [-1, 1] to [0, 1]."""
+    return (x.clamp(-1, 1) + 1) / 2
+
+
+def to_numpy_image(x: torch.Tensor) -> np.ndarray:
+    """x: (C,H,W) in [0,1] → np.ndarray (H,W,C) in [0,1]."""
+    x = x.detach().cpu().clamp(0, 1)
+    x = x.permute(1, 2, 0).numpy()
+    return x
+
+
+def compute_psnr(mse: float, max_val: float = 1.0) -> float:
+    mse = max(mse, 1e-12)
+    return 10.0 * math.log10((max_val ** 2) / mse)
+
+
+def enhance_pil(img: Image.Image, upscale: int = 2) -> Image.Image:
+    """Simple enhancement: upscale + unsharp mask (no training)."""
+    w, h = img.size
+    new_size = (w * upscale, h * upscale)
+    up = img.resize(new_size, Image.LANCZOS)
+    sharp = up.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    return sharp
+
+
+# ===================================
+# 3) Model loading with Streamlit cache
+# ===================================
 
 @st.cache_resource
-def load_gfpgan(upscale: int = 2):
-    """
-    Load a pretrained GFPGAN model.
-    - No training, just inference.
-    - On first run, GFPGAN will download GFPGANv1.4 weights automatically.
-    """
+def load_model(weights_path: str = "model.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    restorer = GFPGANer(
-        model_path='GFPGANv1.4.pth',   # auto-downloaded if not present
-        upscale=upscale,
-        arch='clean',
-        channel_multiplier=2,
-        bg_upsampler=None,             # no RealESRGAN (simpler for Streamlit)
-        device=device
-    )
-    return restorer, device
-
-
-def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
-    buf = BytesIO()
-    img.save(buf, format=fmt)
-    buf.seek(0)
-    return buf.read()
+    model = CAE(latent_dim=128)
+    state = torch.load(weights_path, map_location=device)
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+    return model, device
 
 
 # ==========================
-# 2) Streamlit UI
+# 4) Streamlit UI
 # ==========================
 
-st.set_page_config(page_title="GFPGAN Face Restoration Demo", layout="wide")
+st.set_page_config(page_title="Face Autoencoder + Enhancement Demo", layout="wide")
 
-st.title("🧠 GFPGAN Face Restoration – Pretrained, No Training Needed")
+st.title("🧠 Convolutional Autoencoder – Face Reconstruction & Enhancement")
 st.write(
-    "Upload a face image. The pretrained GFPGAN model will restore and enhance the face "
-    "and optionally upscale the whole image. No dataset or training from your side is "
-    "required – this uses fully pretrained weights."
+    "Upload a face image. The trained autoencoder reconstructs it from a low-dimensional "
+    "latent vector. A simple post-processing enhancement (upscale + sharpening) can "
+    "improve visual quality **without any extra training**."
 )
 
-upscale_factor = st.slider(
-    "Upscale factor (GFPGAN built-in)",
-    min_value=1,
-    max_value=4,
-    value=2,
-    step=1
-)
-
-# Try to load model
+# Load model once
 try:
-    restorer, device = load_gfpgan(upscale=upscale_factor)
-    st.success(f"GFPGAN model loaded on **{device.type.upper()}**")
+    model, device = load_model("model.pth")   # make sure model.pth exists in the repo
+    st.success(f"Autoencoder model loaded on **{device.type.upper()}**")
 except Exception as e:
     st.error(
-        "Could not load GFPGAN model. Make sure `gfpgan` is installed and internet "
-        "access is available for downloading the pretrained weights (GFPGANv1.4)."
+        "Could not load `model.pth`. Make sure it is in the same folder as this app "
+        "or update the path in `load_model(...)`."
     )
     st.exception(e)
     st.stop()
@@ -79,67 +138,80 @@ st.markdown("---")
 st.subheader("1️⃣ Upload an image")
 
 uploaded = st.file_uploader(
-    "Choose an image file (preferably containing one or more faces) – JPG / JPEG / PNG",
+    "Choose an image file (preferably a single face) – formats: JPG / JPEG / PNG",
     type=["jpg", "jpeg", "png"]
 )
 
+upscale_factor = st.slider("Enhancement upscale factor", min_value=1, max_value=4, value=2, step=1)
+apply_enhancement = st.checkbox("Apply enhancement (upscale + sharpen)", value=True)
+
 if uploaded is not None:
-    # Read image as PIL
     pil_img = Image.open(uploaded).convert("RGB")
-    w, h = pil_img.size
 
-    # Convert PIL → OpenCV BGR
-    img_np = np.array(pil_img)
-    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    with st.spinner("Running autoencoder…"):
+        x = preprocess(pil_img).unsqueeze(0).to(device)
 
-    with st.spinner("Running GFPGAN face restoration…"):
-        # has_aligned=False → detect face(s) in the image
-        # only_center_face=False → restore all faces
-        # paste_back=True → put restored face(s) back into original image
-        restored_img, _, _ = restorer.enhance(
-            img_bgr,
-            has_aligned=False,
-            only_center_face=False,
-            paste_back=True
-        )
+        with torch.no_grad():
+            x_hat, z = model(x)
 
-    # Convert back to RGB PIL
-    restored_rgb = cv2.cvtColor(restored_img, cv2.COLOR_BGR2RGB)
-    restored_pil = Image.fromarray(restored_rgb)
+        mse_tensor = F.mse_loss(x_hat, x, reduction="mean")
+        mse_val = float(mse_tensor.item())
 
-    # ========== Show side-by-side ==========
-    c1, c2 = st.columns(2)
+        x_vis = denorm(x[0])
+        xh_vis = denorm(x_hat[0])
 
+        vis_mse = F.mse_loss(x_vis, xh_vis, reduction="mean").item()
+        psnr_val = compute_psnr(vis_mse, max_val=1.0)
+
+        err_map = (x_vis - xh_vis).abs().mean(dim=0)
+
+        recon_pil = Image.fromarray((to_numpy_image(xh_vis) * 255).astype(np.uint8))
+
+        if apply_enhancement:
+            enhanced_pil = enhance_pil(recon_pil, upscale=upscale_factor)
+        else:
+            enhanced_pil = recon_pil
+
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.image(
-            pil_img,
-            caption=f"Original (uploaded) – {w}×{h}",
-            use_column_width=True
-        )
+        st.image(pil_img, caption="Original (uploaded)", use_column_width=True)
     with c2:
+        st.image(recon_pil, caption="Reconstruction (Autoencoder)", use_column_width=True)
+    with c3:
         st.image(
-            restored_pil,
-            caption=f"Restored / Enhanced by GFPGAN – upscale ×{upscale_factor}",
+            enhanced_pil,
+            caption=f"Enhanced (upscale ×{upscale_factor}, sharpen)"
+                    if apply_enhancement else "Enhanced (disabled)",
             use_column_width=True
         )
 
     st.markdown("---")
-    st.subheader("2️⃣ Download enhanced image")
+    st.subheader("2️⃣ Reconstruction metrics")
 
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            label="Download PNG (restored)",
-            data=pil_to_bytes(restored_pil, "PNG"),
-            file_name="restored_gfpgan.png",
-            mime="image/png"
-        )
-    with dl2:
-        st.download_button(
-            label="Download JPEG (restored)",
-            data=pil_to_bytes(restored_pil, "JPEG"),
-            file_name="restored_gfpgan.jpg",
-            mime="image/jpeg"
-        )
+    m1, m2 = st.columns(2)
+    with m1:
+        st.metric("MSE (input vs reconstruction)", f"{mse_val:.6f}")
+    with m2:
+        st.metric("PSNR (on [0,1])", f"{psnr_val:.2f} dB")
+
+    st.caption(
+        "- Smaller MSE → better reconstruction\n"
+        "- Larger PSNR → reconstruction closer to the original image"
+    )
+
+    st.markdown("---")
+    st.subheader("3️⃣ Error heatmap")
+
+    st.write(
+        "Mean absolute error between the original and reconstructed images, "
+        "averaged over RGB channels."
+    )
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    im = ax.imshow(err_map.cpu().numpy(), cmap="inferno")
+    ax.axis("off")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    st.pyplot(fig)
+
 else:
-    st.info("Upload a face image to start GFPGAN restoration.")
+    st.info("Upload an image to start.")
