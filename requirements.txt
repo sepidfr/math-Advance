@@ -2,5 +2,5 @@ streamlit
 torch
 torchvision
 pillow
-matplotlib
 numpy
+realesrgan
