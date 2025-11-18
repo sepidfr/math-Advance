@@ -10,97 +10,129 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 import streamlit as st
+import matplotlib.pyplot as plt
 
 
-# ==========================
-# 1) Autoencoder definition
-# ==========================
+# ======================================================
+# UNet-style Autoencoder (same as in training)
+# ======================================================
 
-class CAE(nn.Module):
-    def __init__(self, latent_dim: int = 128):
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        # Encoder: 3×112×112 → latent_dim
-        self.enc = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(inplace=True),   # 56×56
-            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(inplace=True),  # 28×28
-            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True), # 14×14
-            nn.Conv2d(128, 256, 3, 2, 1), nn.ReLU(inplace=True) # 7×7
-        )
-        self.flatten = nn.Flatten()
-        self.fc_mu   = nn.Linear(256 * 7 * 7, latent_dim)
-
-        # Decoder: latent_dim → 3×112×112
-        self.fc_dec  = nn.Linear(latent_dim, 256 * 7 * 7)
-        self.dec = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(inplace=True),  # 14×14
-            nn.ConvTranspose2d(128, 64,  4, 2, 1), nn.ReLU(inplace=True),  # 28×28
-            nn.ConvTranspose2d(64,  32,  4, 2, 1), nn.ReLU(inplace=True),  # 56×56
-            nn.ConvTranspose2d(32,  3,   4, 2, 1), nn.Tanh()               # 112×112 in [-1,1]
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
         )
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.enc(x)
-        z = self.fc_mu(self.flatten(h))
-        return z
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.fc_dec(z).view(-1, 256, 7, 7)
-        xhat = self.dec(h)
-        return xhat
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = self.encode(x)
-        xhat = self.decode(z)
-        return xhat, z
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
 
-# ==========================================
-# 2) Utility: transforms, metrics, denormal
-# ==========================================
+class UpBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = ConvBlock(in_ch, out_ch)
 
-# Use the same preprocessing as during training:
-# Resize(112×112) + ToTensor + Normalize(mean=0.5, std=0.5) per channel
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        # Pad if necessary
+        if x.size(-1) != skip.size(-1) or x.size(-2) != skip.size(-2):
+            diff_y = skip.size(-2) - x.size(-2)
+            diff_x = skip.size(-1) - x.size(-1)
+            x = F.pad(x, [diff_x // 2, diff_x - diff_x // 2,
+                          diff_y // 2, diff_y - diff_y // 2])
+        x = torch.cat([skip, x], dim=1)
+        x = self.conv(x)
+        return x
+
+
+class UNetAutoencoder(nn.Module):
+    def __init__(self, img_channels: int = 3):
+        super().__init__()
+
+        self.enc1 = ConvBlock(img_channels, 64)
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.enc2 = ConvBlock(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.enc3 = ConvBlock(128, 256)
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.enc4 = ConvBlock(256, 512)
+        self.pool4 = nn.MaxPool2d(2)
+
+        self.bottleneck = ConvBlock(512, 1024)
+
+        self.up4 = UpBlock(1024, 512)
+        self.up3 = UpBlock(512, 256)
+        self.up2 = UpBlock(256, 128)
+        self.up1 = UpBlock(128, 64)
+
+        self.final_conv = nn.Conv2d(64, img_channels, kernel_size=1)
+        self.act_out = nn.Tanh()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.pool1(x1))
+        x3 = self.enc3(self.pool2(x2))
+        x4 = self.enc4(self.pool3(x3))
+        xb = self.bottleneck(self.pool4(x4))
+
+        x = self.up4(xb, x4)
+        x = self.up3(x, x3)
+        x = self.up2(x, x2)
+        x = self.up1(x, x1)
+
+        x = self.final_conv(x)
+        x = self.act_out(x)
+        return x
+
+
+# ======================================================
+# Utilities
+# ======================================================
+
+IMG_SIZE = 112
+
 preprocess = transforms.Compose([
-    transforms.Resize((112, 112)),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize([0.5] * 3, [0.5] * 3)
+    transforms.Normalize([0.5] * 3, [0.5] * 3),
 ])
 
 
 def denorm(x: torch.Tensor) -> torch.Tensor:
-    """
-    Convert from [-1, 1] to [0, 1].
-    x: (C,H,W) or (N,C,H,W).
-    """
+    """Convert from [-1,1] to [0,1]."""
     return (x.clamp(-1, 1) + 1) / 2
 
 
 def to_numpy_image(x: torch.Tensor) -> np.ndarray:
-    """
-    x: (C,H,W) in [0,1] → np.ndarray (H,W,C) in [0,1].
-    """
+    """(C,H,W) in [0,1] -> numpy (H,W,C) in [0,1]."""
     x = x.detach().cpu().clamp(0, 1)
     x = x.permute(1, 2, 0).numpy()
     return x
 
 
 def compute_psnr(mse: float, max_val: float = 1.0) -> float:
-    """
-    PSNR = 10 * log10( max_val^2 / MSE )
-    We compute it on images scaled to [0,1].
-    """
     mse = max(mse, 1e-12)
     return 10.0 * math.log10((max_val ** 2) / mse)
 
 
-# ===================================
-# 3) Model loading with Streamlit cache
-# ===================================
+# ======================================================
+# Load model (Streamlit cache)
+# ======================================================
 
 @st.cache_resource
-def load_model(weights_path: str = "model.pth"):
+def load_model(weights_path: str = "unet_ae.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CAE(latent_dim=128)
+    model = UNetAutoencoder(img_channels=3)
     state = torch.load(weights_path, map_location=device)
     model.load_state_dict(state)
     model.to(device)
@@ -108,27 +140,25 @@ def load_model(weights_path: str = "model.pth"):
     return model, device
 
 
-# ==========================
-# 4) Streamlit UI
-# ==========================
+# ======================================================
+# Streamlit UI
+# ======================================================
 
-st.set_page_config(page_title="Face Autoencoder Demo", layout="wide")
+st.set_page_config(page_title="UNet Autoencoder Face Demo", layout="wide")
 
-st.title("🧠 Convolutional Autoencoder – Face Reconstruction Demo")
+st.title("🧠 UNet-style Convolutional Autoencoder – Face Reconstruction Demo")
 st.write(
-    "Upload a face image, and the trained autoencoder will compress it to a latent "
-    "vector and reconstruct it. You will see **original vs reconstruction** and "
-    "basic reconstruction metrics (MSE, PSNR)."
+    "Upload a face image. The trained UNet autoencoder will reconstruct it. "
+    "You will see the original vs reconstruction, plus MSE, PSNR and an error heatmap."
 )
 
-# Load model once
 try:
-    model, device = load_model("model.pth")
+    model, device = load_model("unet_ae.pth")
     st.success(f"Model loaded on **{device.type.upper()}**")
 except Exception as e:
     st.error(
-        "Could not load `model.pth`. Make sure it is in the same folder as `app.py` "
-        "or update the path in `load_model(...)`."
+        "Could not load `unet_ae.pth`. Make sure it is in the same folder as `app.py`, "
+        "or update the path in `load_model()`."
     )
     st.exception(e)
     st.stop()
@@ -137,12 +167,11 @@ st.markdown("---")
 st.subheader("1️⃣ Upload an image")
 
 uploaded = st.file_uploader(
-    "Choose an image file (preferably a face) – formats: JPG / JPEG / PNG",
+    "Choose an image file (preferably a single face) – JPG / JPEG / PNG",
     type=["jpg", "jpeg", "png"]
 )
 
 if uploaded is not None:
-    # Read image
     pil_img = Image.open(uploaded).convert("RGB")
 
     col1, col2 = st.columns(2)
@@ -150,34 +179,29 @@ if uploaded is not None:
     with col1:
         st.image(pil_img, caption="Original (uploaded)", use_column_width=True)
 
-    # Preprocess and run through model
-    with st.spinner("Running autoencoder…"):
-        x = preprocess(pil_img).unsqueeze(0).to(device)  # (1,3,112,112)
+    with st.spinner("Running UNet autoencoder…"):
+        x = preprocess(pil_img).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            x_hat, z = model(x)  # x_hat: (1,3,112,112)
+            x_hat = model(x)
 
-        # MSE in latent training scale [-1,1]
+        # MSE in normalized space [-1,1]
         mse_tensor = F.mse_loss(x_hat, x, reduction="mean")
         mse_val = float(mse_tensor.item())
 
         # For visualization, move to [0,1]
-        x_vis = denorm(x[0])      # (3,H,W) in [0,1]
+        x_vis = denorm(x[0])
         xh_vis = denorm(x_hat[0])
 
-        # PSNR computed on [0,1]
-        psnr_val = compute_psnr(
-            F.mse_loss(x_vis, xh_vis, reduction="mean").item(),
-            max_val=1.0
-        )
+        vis_mse = F.mse_loss(x_vis, xh_vis, reduction="mean").item()
+        psnr_val = compute_psnr(vis_mse, max_val=1.0)
 
-        # Error map (mean absolute error over channels)
-        err_map = (x_vis - xh_vis).abs().mean(dim=0)  # (H,W)
+        err_map = (x_vis - xh_vis).abs().mean(dim=0)
 
     with col2:
         st.image(
             to_numpy_image(xh_vis),
-            caption="Reconstruction",
+            caption="Reconstruction (UNet AE)",
             use_column_width=True,
         )
 
@@ -199,11 +223,9 @@ if uploaded is not None:
     st.subheader("3️⃣ Error heatmap")
 
     st.write(
-        "This heatmap shows the mean absolute error between the original and the "
-        "reconstructed image, averaged over the RGB channels."
+        "Mean absolute error between the original and reconstructed images, "
+        "averaged over RGB channels."
     )
-
-    import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(4, 4))
     im = ax.imshow(err_map.cpu().numpy(), cmap="inferno")
