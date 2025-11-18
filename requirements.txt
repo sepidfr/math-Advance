@@ -2,5 +2,6 @@ streamlit
 torch
 torchvision
 pillow
-matplotlib
 numpy
+opencv-python-headless
+gfpgan
