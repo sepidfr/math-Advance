@@ -1,0 +1,2 @@
+model_name,train_accuracy,val_accuracy,train_loss,val_loss,f1_score,precision,recall,params,train_time
+CAE_SSIME,0.94,0.88,0.19,0.27,0.86,0.85,0.87,8.1M,42min
